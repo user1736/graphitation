@@ -8,6 +8,7 @@ import {
   OperationDefinitionNode,
   OperationTypeDefinitionNode,
 } from "graphql";
+import { isEqual } from "lodash";
 import {
   collectFields,
   collectSubfields as _collectSubfields,
@@ -303,9 +304,24 @@ interface TMPStoreReadInfo {
   seenProps: Set<string>;
 }
 
+interface TMPStoreSchemaIndex {
+  name: unknown;
+  keyPath?: unknown;
+}
+
+interface TMPStoreSchemaStore {
+  name: unknown;
+  primaryKeyPath?: unknown;
+  indexes?: TMPStoreSchemaIndex[];
+}
+
+interface TMPStoreSchema {
+  stores?: TMPStoreSchemaStore[];
+}
+
 interface TMPStore {
   subscribe: (fn: () => Promise<void>) => TMPStoreSubscriptionResult;
-  _schema?: unknown;
+  _schema?: TMPStoreSchema;
 }
 
 interface TMPStoreSubscriptionResult {
@@ -1534,57 +1550,54 @@ function affectsRead(
   read: TMPStoreReadInfo,
   storeValue: unknown,
 ) {
-  var _a, _b, _c, _d, _e, _f, _g, _h, _i;
-  const storeSchema =
-    (_b = (_a = store._schema) == null ? void 0 : _a.stores) == null
-      ? void 0
-      : _b.find((s) => s.name === read.store);
+  const storeSchema = store._schema?.stores?.find(
+    (schema) => schema.name === read.store,
+  );
   switch (read.method) {
     case "get": {
-      const key = storeSchema == null ? void 0 : storeSchema.primaryKeyPath;
+      const key = storeSchema?.primaryKeyPath;
+      const data = (storeValue as { data?: unknown } | null | undefined)?.data;
+      const dataRecord =
+        !Array.isArray(data) && data != null && typeof data === "object"
+          ? (data as Record<string, unknown>)
+          : undefined;
       if (
         read.args.length > 1 ||
         typeof key !== "string" ||
-        (Array.isArray(storeValue == null ? void 0 : storeValue.data)
-          ? !((_c = storeValue == null ? void 0 : storeValue.data) == null
-              ? void 0
-              : _c.length) ||
-            ((_d = storeValue == null ? void 0 : storeValue.data) == null
-              ? void 0
-              : _d.some((e) => !(e == null ? void 0 : e[key])))
-          : !((_e = storeValue == null ? void 0 : storeValue.data) == null
-              ? void 0
-              : _e[key]))
+        (Array.isArray(data)
+          ? !data.length || data.some((e) => !e?.[key])
+          : !dataRecord?.[key])
       ) {
-        console.log("BRR STRANGE ENTRY", storeValue, read, store);
+        console.log("DEBUG:affectsRead:unexpected-entry", {
+          storeValue,
+          read,
+          store,
+        });
         return false;
       }
       let match;
-      if (Array.isArray(storeValue == null ? void 0 : storeValue.data)) {
-        match =
-          (_f = storeValue == null ? void 0 : storeValue.data) == null
-            ? void 0
-            : _f.find(
-                (item) => (item == null ? void 0 : item[key]) === read.args[0],
-              );
-      } else if (
-        ((_g = storeValue == null ? void 0 : storeValue.data) == null
-          ? void 0
-          : _g[key]) === read.args[0]
-      ) {
-        match = storeValue == null ? void 0 : storeValue.data;
+      if (Array.isArray(data)) {
+        match = data.find(
+          (item) =>
+            (item as Record<string, unknown> | null | undefined)?.[key] ===
+            read.args[0],
+        );
+      } else if (dataRecord?.[key] === read.args[0]) {
+        match = dataRecord;
       }
       if (match) {
         invariant(!isPromise(read.returnValue));
         let dirty = false;
+        const previousValue = read.returnValue as Record<string, unknown>;
+        const matchValue = match as Record<string, unknown>;
         for (const prop of read.seenProps) {
-          if (!_.isEqual(match[prop], read.returnValue[prop])) {
+          if (!isEqual(matchValue[prop], previousValue[prop])) {
             if (prop !== "properties") {
               console.log(
-                "BRR AFFECTS (get)",
+                "DEBUG:affectsRead:get",
                 prop,
-                match[prop],
-                read.returnValue[prop],
+                matchValue[prop],
+                previousValue[prop],
                 read,
                 match,
               );
@@ -1612,33 +1625,29 @@ function affectsRead(
         _storeName,
       ] = read.args;
       const keyPath = indexName
-        ? (_i =
-            (_h = storeSchema.indexes) == null
-              ? void 0
-              : _h.find((i) => i.name === indexName)) == null
-          ? void 0
-          : _i.keyPath
-        : storeSchema.primaryKeyPath;
-      if (
-        keyPath == null ||
-        typeof (storeValue == null ? void 0 : storeValue.data) !== "object"
-      ) {
-        console.log("BRR STRANGE ENTRY", storeValue, read, store);
+        ? storeSchema?.indexes?.find((i) => i.name === indexName)?.keyPath
+        : storeSchema?.primaryKeyPath;
+      const data = (storeValue as { data?: unknown } | null | undefined)?.data;
+      if (keyPath == null || typeof data !== "object") {
+        console.log(
+          "DEBUG:affectsRead:getRange:unexpected-entry",
+          storeValue,
+          read,
+          store,
+        );
         return false;
       }
-      const affects = Array.isArray(
-        storeValue == null ? void 0 : storeValue.data,
-      )
-        ? storeValue.data.some((entry) =>
+      const affects = Array.isArray(data)
+        ? data.some((entry) =>
             matchesRange(keyPath, entry, keyLowRange, keyHighRange),
           )
-        : matchesRange(keyPath, storeValue.data, keyLowRange, keyHighRange);
+        : matchesRange(keyPath, data, keyLowRange, keyHighRange);
       if (affects) {
         console.log(
-          "BRR AFFECTS (getRange)",
+          "DEBUG:affectsRead:getRange",
           `${read.store}:${indexName}`,
           keyPath,
-          storeValue.data,
+          data,
           keyLowRange,
           keyHighRange,
         );
@@ -1650,6 +1659,7 @@ function affectsRead(
   }
   return false;
 }
+
 function matchesRange(keyPath, value, keyLowRange, keyHighRange) {
   let keyValue;
   if (typeof keyPath === "string") {
