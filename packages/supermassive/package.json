@@ -9,6 +9,7 @@
     "directory": "packages/supermassive"
   },
   "scripts": {
+    "foo": "yarn build && cp -r ./lib/ ~/dev/teams-modular-packages/node_modules/@graphitation/supermassive/lib",
     "build": "monorepo-scripts build",
     "lint": "monorepo-scripts lint",
     "test": "monorepo-scripts test",

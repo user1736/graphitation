@@ -122,6 +122,7 @@ export interface ExecutionContext {
   fieldExecutionHooks?: ExecutionHooks;
   subsequentPayloads: Set<IncrementalDataRecord>;
   enablePerEventContext: boolean;
+  liveQueryContext?: LiveQueryContext;
 }
 
 /**
@@ -145,6 +146,9 @@ export function executeWithoutSchema(
   if (!("schemaFragment" in exeContext)) {
     return { errors: exeContext };
   } else {
+    if (exeContext.liveQueryContext) {
+      return Promise.resolve(executeLiveQuery(exeContext));
+    }
     return executeOperationWithBeforeHook(exeContext);
   }
 }
@@ -262,6 +266,122 @@ function buildExecutionContext(
     fieldExecutionHooks,
     subsequentPayloads: new Set(),
     enablePerEventContext: enablePerEventContext ?? true,
+    liveQueryContext: isLiveQuery(operation)
+      ? {
+          deps: /* @__PURE__ */ new Map(),
+          dirtyReads: /* @__PURE__ */ new Map(),
+          invalidate: void 0,
+        }
+      : undefined,
+  };
+}
+
+function isLiveQuery(operation: OperationDefinitionNode) {
+  return [
+    "SimpleCollabLeftRailQuery",
+    "ComponentsChatQueriesMessageListQuery",
+  ].includes(operation.name?.value ?? "");
+}
+
+interface LiveQueryContext {
+  deps: Map<TMPStore, TMPStoreDependency>;
+  dirtyReads: Map<unknown, unknown>;
+  invalidate?: () => void;
+}
+
+interface TMPStoreDependency {
+  subscription: TMPStoreSubscriptionResult;
+  reads: TMPStoreReadInfo[];
+}
+
+interface TMPStoreReadInfo {
+  store: TMPStore;
+  method: string;
+  args: unknown[];
+  path: Path;
+  returnValue: unknown;
+  seenProps: Set<string>;
+}
+
+interface TMPStore {
+  subscribe: (fn: () => Promise<void>) => TMPStoreSubscriptionResult;
+  _schema?: unknown;
+}
+
+interface TMPStoreSubscriptionResult {
+  unsubscribe: () => void;
+}
+
+function executeLiveQuery(exeContext: ExecutionContext) {
+  const { liveQueryContext } = exeContext;
+  invariant(liveQueryContext);
+  let state = "INITIAL";
+  const cleanup = () => {
+    const deps = Array.from(liveQueryContext.deps.values());
+    liveQueryContext.dirtyReads.clear();
+    liveQueryContext.deps.clear();
+    for (const storeDep of deps) {
+      try {
+        storeDep.subscription.unsubscribe();
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  };
+  const runOnce = async () => {
+    invariant(state === "IDLE" || state === "INITIAL");
+    if (state === "IDLE") {
+      console.log("DEBUG:executeLiveQuery:runOnce", exeContext.variableValues, {
+        deps: new Map(liveQueryContext.deps.entries()),
+        dirtyReads: new Map([...liveQueryContext.dirtyReads.entries()]),
+      });
+    }
+    state = "EXECUTING";
+    cleanup();
+    const result = await executeOperationWithBeforeHook({
+      ...exeContext,
+      contextValue: exeContext.buildContextValue
+        ? exeContext.buildContextValue(exeContext.contextValue)
+        : exeContext.contextValue,
+      subsequentPayloads: /* @__PURE__ */ new Set(),
+    });
+    invariant(state === "EXECUTING");
+    invariant(isTotalExecutionResult(result));
+    state = "IDLE";
+    return result;
+  };
+  const runAfterInvalidation = async () => {
+    invariant(state === "IDLE");
+    if (liveQueryContext.dirtyReads.size) {
+      return runOnce();
+    }
+    return new Promise((resolve) => {
+      liveQueryContext.invalidate = () => {
+        liveQueryContext.invalidate = undefined;
+        resolve(runOnce());
+      };
+    });
+  };
+  let done = false;
+  return {
+    async next() {
+      if (done) {
+        return { done, value: undefined };
+      }
+      if (state === "INITIAL") {
+        const value = await runOnce();
+        return { done, value };
+      }
+      if (state === "IDLE") {
+        const value = await runAfterInvalidation();
+        return { done, value };
+      }
+      invariant(false, state);
+    },
+    return() {
+      done = true;
+      return { done, value: undefined };
+    },
   };
 }
 
@@ -1012,7 +1132,25 @@ function resolveAndCompleteField(
     // The resolve function's optional third argument is a context value that
     // is provided to every resolve function within an execution. It is commonly
     // used to represent an authenticated user, or request-specific caches.
-    const contextValue = exeContext.contextValue;
+    const contextValue = exeContext.liveQueryContext
+      ? new Proxy(exeContext.contextValue as object, {
+          get(t, prop, receiver) {
+            const value = Reflect.get(t, prop, receiver);
+            if (prop === "managers") {
+              return proxyManagers(exeContext, value, info);
+            }
+            if (
+              typeof value === "object" &&
+              (value == null ? void 0 : value.store$)
+            ) {
+              return value
+                ? proxyManager(exeContext, value, String(prop), info)
+                : value;
+            }
+            return value;
+          },
+        })
+      : exeContext.contextValue;
 
     if (!isDefaultResolverUsed && hooks?.beforeFieldResolve) {
       hookContext = invokeBeforeFieldResolveHook(info, exeContext);
@@ -1198,6 +1336,358 @@ function resolveAndCompleteField(
     );
     return null;
   }
+}
+
+function proxyManagers(
+  exeContext: ExecutionContext,
+  obj: object,
+  info: ResolveInfo,
+) {
+  return new Proxy(obj, {
+    get(t, prop, receiver) {
+      const value = Reflect.get(t, prop, receiver);
+      return value
+        ? proxyManager(exeContext, value, String(prop), info)
+        : value;
+    },
+  });
+}
+
+function proxyManager(
+  exeContext: ExecutionContext,
+  manager: object,
+  manageName: string,
+  info: ResolveInfo,
+) {
+  const proxy = new Proxy(manager, {
+    get(t, prop, receiver) {
+      const value = Reflect.get(t, prop, receiver);
+      if (prop === "store$") {
+        return value ? proxyStore(exeContext, value, manageName, info) : value;
+      }
+      if (typeof value === "function" && prop !== "constructor") {
+        return function (...args: unknown[]) {
+          return value.call(proxy, ...args);
+        };
+      }
+      return value;
+    },
+  });
+  return proxy;
+}
+
+function proxyStore(
+  exeContext: ExecutionContext,
+  store: TMPStore,
+  managerName: string,
+  info: ResolveInfo,
+) {
+  const proxy = new Proxy(store, {
+    get(t, prop, receiver) {
+      const value = Reflect.get(t, prop, receiver);
+      if (typeof value === "function" && prop !== "constructor") {
+        return function (...args: unknown[]) {
+          if (prop === "executeReadMethodInternal") {
+            try {
+              const result = value.call(proxy, ...args);
+              const readInfo = trackStoreRead(
+                exeContext,
+                store,
+                info,
+                args,
+                result,
+              );
+              return proxyValue(exeContext, store, readInfo, result);
+            } catch (e) {
+              console.log("DEBUG:proxy-store", { e, managerName });
+            }
+          }
+          return value.call(proxy, ...args);
+        };
+      }
+      return value;
+    },
+  });
+  return proxy;
+}
+function proxyValue(
+  exeContext: ExecutionContext,
+  store: TMPStore,
+  read: TMPStoreReadInfo,
+  value: unknown,
+) {
+  if (read.method !== "get") {
+    return value;
+  }
+  return proxyReadMethodResult(exeContext, store, read, value);
+}
+
+function proxyReadMethodResult(
+  exeContext: ExecutionContext,
+  store: TMPStore,
+  read: TMPStoreReadInfo,
+  value: unknown,
+): unknown {
+  if (isPromise(value)) {
+    return value.then((resolved) =>
+      proxyReadMethodResult(exeContext, store, read, resolved),
+    );
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+
+  read.returnValue = (value as { data: unknown }).data;
+
+  return new Proxy(value, {
+    get(t, prop, receiver) {
+      const value2 = Reflect.get(t, prop, receiver);
+      if (prop !== "data") {
+        return value2;
+      }
+      return value2
+        ? new Proxy(value2, {
+            get(t2, prop2, receiver2) {
+              const value3 = Reflect.get(t2, prop2, receiver2);
+              read.seenProps.add(String(prop2));
+              return value3;
+            },
+          })
+        : value2;
+    },
+  });
+}
+
+function trackStoreRead(
+  exeContext: ExecutionContext,
+  store: TMPStore,
+  info: ResolveInfo,
+  args: unknown[],
+  returnValue: unknown,
+) {
+  const { liveQueryContext } = exeContext;
+  invariant(liveQueryContext);
+  let storeDep = liveQueryContext.deps.get(store);
+  if (!storeDep) {
+    storeDep = createStoreDependency(exeContext, store);
+    liveQueryContext.deps.set(store, storeDep);
+  }
+  const readInfo = getReadInfo(info, args, returnValue);
+  storeDep.reads.push(readInfo);
+  return readInfo;
+}
+
+function getReadInfo(info: ResolveInfo, args: unknown[], returnValue: unknown) {
+  const [store, _2, __, ___, method, ____, _____, ...methodArgs] = args;
+  return {
+    store,
+    method,
+    args: methodArgs,
+    path: info.path,
+    returnValue,
+    seenProps: /* @__PURE__ */ new Set(),
+  } as TMPStoreReadInfo;
+}
+
+function createStoreDependency(exeContext: ExecutionContext, store: any) {
+  const dep = {
+    subscription: store.subscribe(async (value: any) => {
+      await invalidateReads(exeContext, store, dep, value);
+    }),
+    reads: [],
+  };
+  return dep;
+}
+
+async function invalidateReads(
+  exeContext: ExecutionContext,
+  store: TMPStore,
+  dep: TMPStoreDependency,
+  storeValue: unknown,
+) {
+  const { liveQueryContext } = exeContext;
+  invariant(liveQueryContext);
+  const awaited = [];
+  for (const read of dep.reads) {
+    if (isPromise(read.returnValue)) {
+      awaited.push(read.returnValue);
+    }
+  }
+  await Promise.allSettled(awaited);
+  for (const read of dep.reads) {
+    if (liveQueryContext.dirtyReads.has(read)) {
+      continue;
+    }
+    if (affectsRead(exeContext, store, read, storeValue)) {
+      liveQueryContext.dirtyReads.set(read, storeValue);
+    }
+  }
+  if (liveQueryContext.dirtyReads.size) {
+    liveQueryContext.invalidate?.();
+  }
+}
+
+function affectsRead(
+  exeContext: ExecutionContext,
+  store: TMPStore,
+  read: TMPStoreReadInfo,
+  storeValue: unknown,
+) {
+  var _a, _b, _c, _d, _e, _f, _g, _h, _i;
+  const storeSchema =
+    (_b = (_a = store._schema) == null ? void 0 : _a.stores) == null
+      ? void 0
+      : _b.find((s) => s.name === read.store);
+  switch (read.method) {
+    case "get": {
+      const key = storeSchema == null ? void 0 : storeSchema.primaryKeyPath;
+      if (
+        read.args.length > 1 ||
+        typeof key !== "string" ||
+        (Array.isArray(storeValue == null ? void 0 : storeValue.data)
+          ? !((_c = storeValue == null ? void 0 : storeValue.data) == null
+              ? void 0
+              : _c.length) ||
+            ((_d = storeValue == null ? void 0 : storeValue.data) == null
+              ? void 0
+              : _d.some((e) => !(e == null ? void 0 : e[key])))
+          : !((_e = storeValue == null ? void 0 : storeValue.data) == null
+              ? void 0
+              : _e[key]))
+      ) {
+        console.log("BRR STRANGE ENTRY", storeValue, read, store);
+        return false;
+      }
+      let match;
+      if (Array.isArray(storeValue == null ? void 0 : storeValue.data)) {
+        match =
+          (_f = storeValue == null ? void 0 : storeValue.data) == null
+            ? void 0
+            : _f.find(
+                (item) => (item == null ? void 0 : item[key]) === read.args[0],
+              );
+      } else if (
+        ((_g = storeValue == null ? void 0 : storeValue.data) == null
+          ? void 0
+          : _g[key]) === read.args[0]
+      ) {
+        match = storeValue == null ? void 0 : storeValue.data;
+      }
+      if (match) {
+        invariant(!isPromise(read.returnValue));
+        let dirty = false;
+        for (const prop of read.seenProps) {
+          if (!_.isEqual(match[prop], read.returnValue[prop])) {
+            if (prop !== "properties") {
+              console.log(
+                "BRR AFFECTS (get)",
+                prop,
+                match[prop],
+                read.returnValue[prop],
+                read,
+                match,
+              );
+            }
+            dirty = true;
+          }
+        }
+        if (dirty) {
+          return true;
+        }
+      }
+      return false;
+    }
+    case "getRange": {
+      const [
+        indexName,
+        keyLowRange,
+        keyHighRange,
+        // TODO:
+        _lowRangeExclusive,
+        _highRangeExclusive,
+        _reverseOrSortOrder,
+        _limit,
+        _offset,
+        _storeName,
+      ] = read.args;
+      const keyPath = indexName
+        ? (_i =
+            (_h = storeSchema.indexes) == null
+              ? void 0
+              : _h.find((i) => i.name === indexName)) == null
+          ? void 0
+          : _i.keyPath
+        : storeSchema.primaryKeyPath;
+      if (
+        keyPath == null ||
+        typeof (storeValue == null ? void 0 : storeValue.data) !== "object"
+      ) {
+        console.log("BRR STRANGE ENTRY", storeValue, read, store);
+        return false;
+      }
+      const affects = Array.isArray(
+        storeValue == null ? void 0 : storeValue.data,
+      )
+        ? storeValue.data.some((entry) =>
+            matchesRange(keyPath, entry, keyLowRange, keyHighRange),
+          )
+        : matchesRange(keyPath, storeValue.data, keyLowRange, keyHighRange);
+      if (affects) {
+        console.log(
+          "BRR AFFECTS (getRange)",
+          `${read.store}:${indexName}`,
+          keyPath,
+          storeValue.data,
+          keyLowRange,
+          keyHighRange,
+        );
+      }
+      return affects;
+    }
+    case "getAll":
+      return true;
+  }
+  return false;
+}
+function matchesRange(keyPath, value, keyLowRange, keyHighRange) {
+  let keyValue;
+  if (typeof keyPath === "string") {
+    keyValue = value[keyPath];
+  } else if (Array.isArray(keyPath)) {
+    keyValue = keyPath.map((path) => value[path]);
+  } else {
+    console.log("BRR STRANGE RANGE", arguments);
+    return false;
+  }
+  if (keyValue == null) {
+    console.log("BRR STRANGE RANGE", arguments);
+    return false;
+  }
+  const compareResult = {
+    low: keyLowRange != null ? compareKeys(keyValue, keyLowRange) : 1,
+    high: keyHighRange != null ? compareKeys(keyValue, keyHighRange) : -1,
+  };
+  return compareResult.low >= 0 && compareResult.high <= 0;
+}
+
+function compareKeys(a, b) {
+  if (a == null && b == null) return 0;
+  if (a == null) return -1;
+  if (b == null) return 1;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    const minLength = Math.min(a.length, b.length);
+    for (let i = 0; i < minLength; i++) {
+      const result = compareKeys(a[i], b[i]);
+      if (result !== 0) return result;
+    }
+    return a.length - b.length;
+  }
+  if (Array.isArray(a) && !Array.isArray(b)) return 1;
+  if (!Array.isArray(a) && Array.isArray(b)) return -1;
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
 }
 
 /**
