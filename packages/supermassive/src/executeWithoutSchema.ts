@@ -1660,18 +1660,33 @@ function affectsRead(
   return false;
 }
 
-function matchesRange(keyPath, value, keyLowRange, keyHighRange) {
+function matchesRange(
+  keyPath: any,
+  value: any,
+  keyLowRange: any,
+  keyHighRange: any,
+) {
   let keyValue;
   if (typeof keyPath === "string") {
     keyValue = value[keyPath];
   } else if (Array.isArray(keyPath)) {
     keyValue = keyPath.map((path) => value[path]);
   } else {
-    console.log("BRR STRANGE RANGE", arguments);
+    console.log("DEBUG:matchesRange:strange-value", {
+      keyPath,
+      value,
+      keyLowRange,
+      keyHighRange,
+    });
     return false;
   }
   if (keyValue == null) {
-    console.log("BRR STRANGE RANGE", arguments);
+    console.log("DEBUG:matchesRange:strange-value", {
+      keyPath,
+      value,
+      keyLowRange,
+      keyHighRange,
+    });
     return false;
   }
   const compareResult = {
@@ -1681,7 +1696,7 @@ function matchesRange(keyPath, value, keyLowRange, keyHighRange) {
   return compareResult.low >= 0 && compareResult.high <= 0;
 }
 
-function compareKeys(a, b) {
+function compareKeys(a: any, b: any): number {
   if (a == null && b == null) return 0;
   if (a == null) return -1;
   if (b == null) return 1;
